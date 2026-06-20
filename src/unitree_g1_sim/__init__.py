@@ -13,6 +13,12 @@ from .simulator import (
     RobotTelemetry,
     create_simulator,
 )
+from .builtin_tests import (
+    TEST_CATALOG,
+    TestResult,
+    TestStatus,
+    TestStep,
+)
 
 __all__ = [
     "G1Simulator",
@@ -27,5 +33,9 @@ __all__ = [
     "G1_SPECS",
     "JOINT_NAME_MAP",
     "JOINT_GROUPS",
+    "TEST_CATALOG",
+    "TestResult",
+    "TestStatus",
+    "TestStep",
 ]
 __version__ = "0.1.0"
