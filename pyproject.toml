@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "unitree-g1-sim"
 version = "0.1.0"
-description = "Lightweight pure-Python diagnostic simulator for the Unitree G1 humanoid robot"
+description = "Hardware-free development sandbox for the Unitree G1 (29-DOF) humanoid robot"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"

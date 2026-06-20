@@ -1,17 +1,21 @@
 # unitree-g1-sim
 
-> Lightweight pure-Python diagnostic simulator for the **Unitree G1** (29-DOF) humanoid robot.
-> No MuJoCo. No Isaac Sim. No ROS. Just `pip install` and go.
+> Hardware-free development sandbox for the **Unitree G1** (29-DOF) humanoid robot.
+> No MuJoCo. No Isaac Sim. No ROS. No hardware. Just `pip install` and go.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://pypi.org/project/unitree-g1-sim/)
 
 ## Why?
 
-Existing G1 simulators require heavy physics engines (MuJoCo, Isaac Sim).
-This one is designed for **diagnostic testing** — CI/CD pipelines, hardware-less
-development, and robot health monitoring systems. It generates realistic
-joint/IMU/power telemetry across all 29 DOF, with configurable fault injection.
+Want to build a control panel, telemetry dashboard, fault detection algorithm, or CI pipeline
+for the G1 — but don't have the robot sitting next to you? This gives you a realistic,
+deterministic sandbox that behaves like a real G1 without touching hardware.
+
+It's not a physics simulator (it won't tell you if the robot will fall over). It's a
+**development sandbox**: realistic joint kinematics, IMU noise, battery drain, thermal
+behavior, and injectable faults — enough to develop, test, and demo the entire software
+stack without a $160K robot.
 
 ## Install
 
@@ -50,7 +54,7 @@ asyncio.run(main())
 ## Features
 
 - **29 joints** with realistic kinematics and hardware limits
-- **IMU simulation** (accel, gyro) with configurable noise models
+- **IMU simulation** (accel, gyro) with state-dependent noise models
 - **Battery model** with Coulomb counting and voltage sag
 - **Thermal model** with load-based heating and natural cooling
 - **Fault injection**: joint overtemperature, position error, IMU drift, low battery, comm timeout
