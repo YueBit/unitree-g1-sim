@@ -38,9 +38,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YueBit/g1-sim"
-Repository = "https://github.com/YueBit/g1-sim"
-Issues = "https://github.com/YueBit/g1-sim/issues"
+Homepage = "https://github.com/YueBit/unitree-g1-sim"
+Repository = "https://github.com/YueBit/unitree-g1-sim"
+Issues = "https://github.com/YueBit/unitree-g1-sim/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/unitree_g1_sim"]
