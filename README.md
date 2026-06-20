@@ -119,4 +119,3 @@ Apache 2.0 — see [LICENSE](LICENSE).
 ## Related
 
 - [Unitree Robotics](https://github.com/unitreerobotics) — official G1 repos
-- [RoboDiag](https://github.com/YueBit/RoboDiag) — AI diagnostic platform (uses unitree-g1-sim)
