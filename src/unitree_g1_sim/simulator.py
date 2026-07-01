@@ -26,7 +26,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -62,6 +62,8 @@ _TEMP_HEATING_RATE = 0.005      # °C per tick per unit load
 _TEMP_COOLING_RATE = 0.001      # °C natural cooling per tick
 _OVERTEMP_RAMP = 0.5            # °C per tick when fault injected
 _OVERTEMP_CEILING = 92.0        # hard ceiling for injected fault
+_TEMP_SENSOR_NOISE = 0.15       # sensor quantization noise (σ, °C)
+_TEMP_THERMAL_LAG = 0.02        # thermal lag coefficient (smaller = more lag)
 
 # ── Battery model ──
 _INITIAL_SOC_PCT = 85.0         # starting SOC (%)
@@ -101,6 +103,10 @@ _FAULT_POSITION_OFFSET_MAX = 0.6
 _FAULT_ERROR_CODE = 0x04           # 关节位置错误
 _OVERTEMP_JOINT_IDS = (3, 9)       # left/right knees (high-load joints)
 _POSITION_ERROR_JOINT_IDS = (3, 9) # same targets for position fault demo
+
+# ── Comm timeout ──
+_COMM_TIMEOUT_DROP_PROB = 0.3      # probability of dropping a frame during timeout
+_COMM_TIMEOUT_ZERO_PROB = 0.5      # probability of zeroing joint data
 
 # ═══════════════════════════════════════════════════════════════════
 #  Enums
@@ -184,6 +190,35 @@ class RobotTelemetry:
     active_faults: list[str] = field(default_factory=list)
     uptime_s: float = 0.0
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-serializable dict (for recording/export)."""
+        return {
+            "timestamp": self.timestamp,
+            "state": self.state.value,
+            "joints": [
+                {
+                    "name": j.name, "position": j.position,
+                    "velocity": j.velocity, "torque": j.torque,
+                    "temperature": j.temperature, "error_code": j.error_code,
+                }
+                for j in self.joints
+            ],
+            "imu": {
+                "roll": self.imu.roll, "pitch": self.imu.pitch,
+                "yaw": self.imu.yaw,
+                "gyro_x": self.imu.gyro_x, "gyro_y": self.imu.gyro_y,
+                "gyro_z": self.imu.gyro_z,
+                "accel_x": self.imu.accel_x, "accel_y": self.imu.accel_y,
+                "accel_z": self.imu.accel_z,
+            },
+            "power": {
+                "voltage": self.power.voltage, "current": self.power.current,
+                "soc": self.power.soc, "power_w": self.power.power_w,
+            },
+            "active_faults": self.active_faults,
+            "uptime_s": self.uptime_s,
+        }
+
 # ═══════════════════════════════════════════════════════════════════
 #  Simulator
 # ═══════════════════════════════════════════════════════════════════
@@ -214,9 +249,14 @@ class G1Simulator:
         )
         self._inject_faults: list[FaultType] = []
         self._running = False
-        self._telemetry_callbacks: list[Callable] = []
+        self._telemetry_callbacks: list[Callable[[RobotTelemetry], None]] = []
         self._tick = 0
         self._lock = asyncio.Lock()
+        # Temperature sensor: store "true" temp and "reported" temp with thermal lag
+        self._true_temps: dict[str, float] = {}
+        self._reported_temps: dict[str, float] = {}
+        # Recording buffer
+        self._recording: list[dict[str, Any]] | None = None
         self._init_joint_states()
 
     # ── internal init ──────────────────────────────────────────────
@@ -224,19 +264,24 @@ class G1Simulator:
     def _init_joint_states(self) -> None:
         """Populate per-joint state dictionaries from G1_JOINTS config."""
         for j in G1_JOINTS:
-            self._joint_states[j["name"]] = {
+            name = j["name"]
+            init_temp = _INITIAL_TEMP_C + self._rng.uniform(
+                -_INITIAL_TEMP_SPREAD, _INITIAL_TEMP_SPREAD
+            )
+            self._joint_states[name] = {
                 "position": 0.0,
                 "target": 0.0,
                 "velocity": 0.0,
                 "torque": 0.0,
-                "temperature": _INITIAL_TEMP_C
-                + self._rng.uniform(-_INITIAL_TEMP_SPREAD, _INITIAL_TEMP_SPREAD),
+                "temperature": init_temp,
                 "error_code": 0,
                 "limits": j["limits"],
                 "max_velocity": j["max_velocity"],
                 "max_torque": j["max_torque"],
                 "group": j["group"],
             }
+            self._true_temps[name] = init_temp
+            self._reported_temps[name] = init_temp
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -271,26 +316,94 @@ class G1Simulator:
     def clear_faults(self) -> None:
         """Remove all injected faults and reset joint error codes."""
         self._inject_faults.clear()
-        for j in self._joint_states.values():
+        for name, j in self._joint_states.items():
             j["error_code"] = 0
             if j["temperature"] > G1_SPECS["max_joint_temp_celsius"]:
                 j["temperature"] = 35.0
+                self._true_temps[name] = 35.0
+                self._reported_temps[name] = 35.0
+
+    # ── callbacks & recording ─────────────────────────────────────
+
+    def on_telemetry(self, callback: Callable[[RobotTelemetry], None]) -> None:
+        """Register a callback to be invoked on every telemetry frame.
+
+        Useful for WebSocket streaming, logging, or real-time dashboards.
+        Callbacks are called synchronously inside ``get_telemetry()``.
+
+        Example::
+
+            sim.on_telemetry(lambda tele: websocket.send(tele.to_dict()))
+        """
+        self._telemetry_callbacks.append(callback)
+
+    def remove_callback(self, callback: Callable[[RobotTelemetry], None]) -> None:
+        """Remove a previously registered callback."""
+        if callback in self._telemetry_callbacks:
+            self._telemetry_callbacks.remove(callback)
+
+    def _notify_callbacks(self, tele: RobotTelemetry) -> None:
+        """Invoke all registered telemetry callbacks."""
+        for cb in self._telemetry_callbacks:
+            try:
+                cb(tele)
+            except Exception:
+                pass  # Don't let one broken callback break the pipeline
+
+    def start_recording(self) -> None:
+        """Begin recording telemetry frames to an in-memory buffer.
+
+        Call ``stop_recording()`` to retrieve the recorded frames.
+        """
+        self._recording = []
+
+    def stop_recording(self) -> list[dict[str, Any]]:
+        """Stop recording and return all captured frames as dicts.
+
+        Returns an empty list if recording was not active.
+        """
+        frames = self._recording or []
+        self._recording = None
+        return frames
+
+    def is_recording(self) -> bool:
+        """Return True if recording is currently active."""
+        return self._recording is not None
 
     def get_telemetry(self) -> RobotTelemetry:
-        """Generate one telemetry frame."""
+        """Generate one telemetry frame. Fires registered callbacks."""
         self._tick += 1
         t = time.time()
         uptime = (self._tick - self._start_tick) * _TELEMETRY_DT_S
+
+        # COMM_TIMEOUT: randomly drop frames or corrupt data
+        if FaultType.COMM_TIMEOUT in self._inject_faults:
+            if self._rng.random() < _COMM_TIMEOUT_DROP_PROB:
+                tele = RobotTelemetry(
+                    timestamp=t, state=self.state,
+                    joints=[], imu=IMUTelemetry(0,0,0,0,0,0,0,0,0),
+                    power=PowerTelemetry(0,0,0,0),
+                    active_faults=["COMM_TIMEOUT:通信中断-丢帧"],
+                    uptime_s=uptime,
+                )
+                self._notify_callbacks(tele)
+                return tele
 
         joints = self._compute_joints(uptime)
         imu = self._compute_imu(uptime)
         power = self._compute_power(uptime)
         faults = self._get_active_faults(joints, imu, power)
 
+        if FaultType.COMM_TIMEOUT in self._inject_faults and self._rng.random() < _COMM_TIMEOUT_ZERO_PROB:
+            for j in joints:
+                j.position = 0.0
+                j.velocity = 0.0
+                j.torque = 0.0
+
         if faults:
             self.state = RobotState.FAULT
 
-        return RobotTelemetry(
+        tele = RobotTelemetry(
             timestamp=t,
             state=self.state,
             joints=joints,
@@ -299,6 +412,13 @@ class G1Simulator:
             active_faults=faults,
             uptime_s=uptime,
         )
+
+        self._notify_callbacks(tele)
+
+        if self._recording is not None:
+            self._recording.append(tele.to_dict())
+
+        return tele
 
     # ── joint kinematics ───────────────────────────────────────────
 
@@ -328,7 +448,7 @@ class G1Simulator:
                 freq = _WALKING_FREQ_HZ if group in ("left_leg", "right_leg") else 0.5
                 amp = (
                     _WALKING_LEG_AMP
-                    if "knee" in name or "hip" in name
+                    if "knee" in name or "hip" in name or "ankle" in name
                     else _WALKING_NONLEG_AMP
                 )
                 pos = (
@@ -358,10 +478,20 @@ class G1Simulator:
                 -j_config["max_torque"], min(j_config["max_torque"], torque)
             )
 
-            # ── thermal model ──
+            # ── thermal model (with sensor noise + thermal lag) ──
             load_factor = abs(torque) / max(j_config["max_torque"], 1)
-            s["temperature"] += load_factor * _TEMP_HEATING_RATE - _TEMP_COOLING_RATE
-            s["temperature"] = max(_AMBIENT_TEMP_C, s["temperature"])
+            # True physical temperature
+            true_temp: float = self._true_temps.get(name, float(s["temperature"]))
+            true_temp += load_factor * _TEMP_HEATING_RATE - _TEMP_COOLING_RATE
+            true_temp = max(_AMBIENT_TEMP_C, true_temp)
+            self._true_temps[name] = true_temp
+            # Reported temperature: lagged true temp + sensor noise
+            reported: float = self._reported_temps.get(name, true_temp)
+            reported += (true_temp - reported) * _TEMP_THERMAL_LAG
+            reported += self._np_rng.normal(0, _TEMP_SENSOR_NOISE)
+            reported = max(_AMBIENT_TEMP_C, reported)
+            self._reported_temps[name] = reported
+            s["temperature"] = reported
 
             # ── fault injection ──
             error_code = 0
@@ -369,9 +499,11 @@ class G1Simulator:
                 FaultType.JOINT_OVERTEMP in self._inject_faults
                 and jid in _OVERTEMP_JOINT_IDS
             ):
-                s["temperature"] = min(
-                    s["temperature"] + _OVERTEMP_RAMP, _OVERTEMP_CEILING
+                self._true_temps[name] = min(
+                    true_temp + _OVERTEMP_RAMP, _OVERTEMP_CEILING
                 )
+                self._reported_temps[name] = self._true_temps[name]
+                s["temperature"] = self._true_temps[name]
             if (
                 FaultType.JOINT_POSITION_ERROR in self._inject_faults
                 and jid in _POSITION_ERROR_JOINT_IDS

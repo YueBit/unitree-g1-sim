@@ -15,6 +15,7 @@ from unitree_g1_sim import (
     JointTelemetry,
     IMUTelemetry,
     PowerTelemetry,
+    RobotTelemetry,
 )
 from unitree_g1_sim.builtin_tests import TEST_CATALOG, TestStatus
 
@@ -327,3 +328,140 @@ def test_config_specs_complete():
     ]
     for key in required:
         assert key in G1_SPECS
+
+# ═══════════════════════════════════════════════════════════════════
+#  New features: callbacks, recording, comm_timeout, temp noise
+# ═══════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_telemetry_callback_fires():
+    """Callbacks should be invoked on every get_telemetry() call."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+    sim.set_state(RobotState.STANDING)
+
+    frames = []
+    sim.on_telemetry(lambda t: frames.append(t))
+
+    for _ in range(5):
+        sim.get_telemetry()
+
+    assert len(frames) == 5
+    assert all(isinstance(f, RobotTelemetry) for f in frames)
+
+@pytest.mark.asyncio
+async def test_callback_remove():
+    """Removed callbacks should not fire."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+
+    frames = []
+    cb = lambda t: frames.append(t)
+    sim.on_telemetry(cb)
+    sim.get_telemetry()
+    assert len(frames) == 1
+
+    sim.remove_callback(cb)
+    sim.get_telemetry()
+    assert len(frames) == 1  # No new frame
+
+@pytest.mark.asyncio
+async def test_recording_start_stop():
+    """Recording should capture frames and stop on command."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+    sim.set_state(RobotState.STANDING)
+
+    sim.start_recording()
+    assert sim.is_recording()
+
+    for _ in range(10):
+        sim.get_telemetry()
+
+    frames = sim.stop_recording()
+    assert not sim.is_recording()
+    assert len(frames) == 10
+    assert all("joints" in f for f in frames)
+    assert all("imu" in f for f in frames)
+    assert all("power" in f for f in frames)
+
+@pytest.mark.asyncio
+async def test_comm_timeout_drops_frames():
+    """COMM_TIMEOUT should sometimes return empty telemetry."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+    sim.set_state(RobotState.STANDING)
+    sim.inject_fault(FaultType.COMM_TIMEOUT)
+
+    drop_seen = zero_seen = normal_seen = False
+    for _ in range(100):
+        tele = sim.get_telemetry()
+        if len(tele.joints) == 0:
+            drop_seen = True
+        elif all(j.position == 0.0 for j in tele.joints):
+            zero_seen = True
+        else:
+            normal_seen = True
+
+    # With 100 frames, we should see at least one drop or zero due to COMM_TIMEOUT
+    assert drop_seen or zero_seen, (
+        "COMM_TIMEOUT should cause frame drops or zeroed data"
+    )
+
+@pytest.mark.asyncio
+async def test_comm_timeout_fault_appears():
+    """COMM_TIMEOUT should appear in active_faults."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+    sim.inject_fault(FaultType.COMM_TIMEOUT)
+
+    # Should eventually report the fault
+    fault_seen = False
+    for _ in range(50):
+        tele = sim.get_telemetry()
+        if any("COMM_TIMEOUT" in f for f in tele.active_faults):
+            fault_seen = True
+            break
+
+    assert fault_seen, "COMM_TIMEOUT fault should appear in active_faults"
+
+@pytest.mark.asyncio
+async def test_temperature_has_noise():
+    """Temperature readings should show sensor noise (not purely deterministic)."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+    sim.set_state(RobotState.STANDING)
+
+    temps = []
+    for _ in range(10):
+        tele = sim.get_telemetry()
+        temps.append([j.temperature for j in tele.joints])
+
+    # With thermal lag + noise, temperature should vary slightly between frames
+    # Check the left knee (index 3) has non-identical values over 10 frames
+    knee_temps = [t[3] for t in temps]
+    assert len(set(knee_temps)) > 1, (
+        "Temperature should vary due to sensor noise + thermal lag"
+    )
+
+@pytest.mark.asyncio
+async def test_telemetry_to_dict():
+    """to_dict() should return a JSON-serializable structure."""
+    sim = G1Simulator(seed=42)
+    await sim.connect()
+    sim.set_state(RobotState.STANDING)
+    tele = sim.get_telemetry()
+    d = tele.to_dict()
+
+    assert isinstance(d, dict)
+    assert isinstance(d["timestamp"], float)
+    assert isinstance(d["state"], str)
+    assert len(d["joints"]) == 29
+    assert "roll" in d["imu"]
+    assert "voltage" in d["power"]
+    assert "soc" in d["power"]
+    assert isinstance(d["active_faults"], list)
+
+    import json
+    json_str = json.dumps(d)
+    assert isinstance(json_str, str)
